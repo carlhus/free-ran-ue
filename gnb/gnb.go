@@ -74,6 +74,8 @@ type Gnb struct {
 	tai    ie.TAI
 	snssai ie.SNSSAI
 
+	ratInformation *ie.RATInformation
+
 	staticNrdc bool
 
 	xnInterface
@@ -143,6 +145,12 @@ func NewGnb(config *model.GnbConfig, gnbLogger *logger.GnbLogger) *Gnb {
 		return nil
 	}
 
+	ratInformation, err := ratInformationToNgap(config.Gnb.RatInformation)
+	if err != nil {
+		gnbLogger.CfgLog.Errorf("Error converting ratInformation to ngap: %v", err)
+		return nil
+	}
+
 	return &Gnb{
 		amfN2Ip:           config.Gnb.AmfN2Ip,
 		ranN2Ip:           config.Gnb.RanN2Ip,
@@ -164,6 +172,8 @@ func NewGnb(config *model.GnbConfig, gnbLogger *logger.GnbLogger) *Gnb {
 		plmnId: plmnId,
 		tai:    tai,
 		snssai: snssai,
+
+		ratInformation: ratInformation,
 
 		staticNrdc: config.Gnb.StaticNrdc,
 		xnInterface: xnInterface{
@@ -453,7 +463,7 @@ func (g *Gnb) connectToUpf() error {
 func (g *Gnb) setupN2() error {
 	g.RanLog.Infoln("Setting up N2")
 
-	request, err := getNgapSetupRequest(g.gnbId, g.gnbName, g.plmnId, g.tai, g.snssai)
+	request, err := getNgapSetupRequest(g.gnbId, g.gnbName, g.plmnId, g.tai, g.snssai, g.ratInformation)
 	if err != nil {
 		return fmt.Errorf("error getting NGAP setup request: %v", err)
 	}
