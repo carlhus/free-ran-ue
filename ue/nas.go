@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/free-ran-ue/free-ran-ue/v2/constant"
 	"github.com/free-ran-ue/util"
 	"github.com/free5gc/nas/ie"
 	"github.com/free5gc/nas/message"
@@ -21,7 +22,7 @@ func nasDecode(ue *Ue, payload []byte) (message.Message, error) {
 func readAndDecodeNas[T message.Message](u *Ue, label string) (T, error) {
 	var zero T
 
-	buf := make([]byte, 1024)
+	buf := make([]byte, constant.NAS_MESSAGE_BUFFER_SIZE)
 	n, err := u.ranControlPlaneConn.Read(buf)
 	if err != nil {
 		return zero, fmt.Errorf("error read %s: %+v", label, err)
@@ -175,8 +176,9 @@ func getNasRegistrationCompleteMessage() *message.RegComplete {
 
 // buildPduSessionEstablishmentRequest returns the plain-encoded bytes of a
 // PDUSessEstReq. It is never sent standalone; it is always embedded as the
-// payload container of an UL NAS Transport message.
-func buildPduSessionEstablishmentRequest(pduSessionId uint8) ([]byte, error) {
+// payload container of an UL NAS Transport message. The operator containers
+// are carried as is in its ePCO.
+func buildPduSessionEstablishmentRequest(pduSessionId uint8, operatorContainers []ie.OperatorContainer) ([]byte, error) {
 	pduSessionEstablishmentRequest := &message.PDUSessEstReq{
 		PDUSessId: pduSessionId,
 		PTI:       0x00,
@@ -192,8 +194,9 @@ func buildPduSessionEstablishmentRequest(pduSessionId uint8) ([]byte, error) {
 		},
 		ExtendedProtCfgOpts: &ie.ExtendedProtCfgOpts{
 			FromMs: &ie.ExtCfgOptFromMs{
-				DNSV4Req: true,
-				DNSV6Req: true,
+				DNSV4Req:           true,
+				DNSV6Req:           true,
+				OperatorContainers: operatorContainers,
 			},
 		},
 	}
@@ -201,8 +204,40 @@ func buildPduSessionEstablishmentRequest(pduSessionId uint8) ([]byte, error) {
 	return pduSessionEstablishmentRequest.MarshalBinary()
 }
 
-func getPduSessionEstablishmentRequest(pduSessionId uint8) ([]byte, error) {
-	return buildPduSessionEstablishmentRequest(pduSessionId)
+func getPduSessionEstablishmentRequest(pduSessionId uint8, operatorContainers []ie.OperatorContainer) ([]byte, error) {
+	return buildPduSessionEstablishmentRequest(pduSessionId, operatorContainers)
+}
+
+// buildPduSessionModificationRequest returns the plain-encoded bytes of a
+// PDUSessModReq that carries only the operator containers in its ePCO.
+func buildPduSessionModificationRequest(pduSessionId, pti uint8, operatorContainers []ie.OperatorContainer) ([]byte, error) {
+	pduSessionModificationRequest := &message.PDUSessModReq{
+		PDUSessId: pduSessionId,
+		PTI:       pti,
+	}
+	if len(operatorContainers) > 0 {
+		pduSessionModificationRequest.ExtendedProtCfgOpts = &ie.ExtendedProtCfgOpts{
+			FromMs: &ie.ExtCfgOptFromMs{OperatorContainers: operatorContainers},
+		}
+	}
+
+	return pduSessionModificationRequest.MarshalBinary()
+}
+
+func buildPduSessionModificationComplete(pduSessionId, pti uint8) ([]byte, error) {
+	return (&message.PDUSessModComplete{PDUSessId: pduSessionId, PTI: pti}).MarshalBinary()
+}
+
+func buildPduSessionModificationCommandReject(pduSessionId, pti, cause uint8) ([]byte, error) {
+	return (&message.PDUSessModCmdRej{
+		PDUSessId: pduSessionId,
+		PTI:       pti,
+		Cause5GSM: &ie.Cause5GSM{Value: cause},
+	}).MarshalBinary()
+}
+
+func buildPduSessionReleaseComplete(pduSessionId, pti uint8) ([]byte, error) {
+	return (&message.PDUSessRelComplete{PDUSessId: pduSessionId, PTI: pti}).MarshalBinary()
 }
 
 func buildUlNasTransportMessage(nasMessageContainer []byte, pduSessionId uint8, requestType ie.ConstReqType, dnn string, sNssai *models.Snssai) *message.ULNASTransport {
@@ -240,6 +275,23 @@ func getUlNasTransportMessage(nasMessageContainer []byte, pduSessionId uint8, re
 	return buildUlNasTransportMessage(nasMessageContainer, pduSessionId, requestType, dnn, sNssai)
 }
 
+// buildUlNasTransportForPduSession carries a 5GSM message of an established
+// PDU session, so it has neither request type, DNN nor S-NSSAI.
+func buildUlNasTransportForPduSession(nasMessageContainer []byte, pduSessionId uint8) *message.ULNASTransport {
+	return &message.ULNASTransport{
+		PayloadCntrType: &ie.PayloadCntrType{
+			Value: ie.PayloadCntrType_N1SMInfo,
+		},
+		PayloadCntr: &ie.PayloadCntr{
+			Pct:      ie.PayloadCntrType_N1SMInfo,
+			Contents: nasMessageContainer,
+		},
+		PDUSessID: &ie.PDUSessId2{
+			Value: pduSessionId,
+		},
+	}
+}
+
 func buildUeDeRegistrationRequest(accessType uint8, switchOff uint8, ngKsi uint8, mobileIdentity5GS *ie.MobileId5GS) *message.DeregReqUEOrig {
 	return &message.DeregReqUEOrig{
 		DeregType: &ie.DeregType{
@@ -257,6 +309,20 @@ func buildUeDeRegistrationRequest(accessType uint8, switchOff uint8, ngKsi uint8
 
 func getUeDeRegistrationRequest(accessType uint8, switchOff uint8, ngKsi uint8, mobileIdentity5GS *ie.MobileId5GS) *message.DeregReqUEOrig {
 	return buildUeDeRegistrationRequest(accessType, switchOff, ngKsi, mobileIdentity5GS)
+}
+
+func operatorContainersFromNw(extendedProtCfgOpts *ie.ExtendedProtCfgOpts) []ie.OperatorContainer {
+	if extendedProtCfgOpts == nil || extendedProtCfgOpts.FromNw == nil {
+		return nil
+	}
+	return extendedProtCfgOpts.FromNw.OperatorContainers
+}
+
+func cause5gsmValue(cause *ie.Cause5GSM) uint8 {
+	if cause == nil {
+		return 0
+	}
+	return cause.Value
 }
 
 func getNasPduFromNasPduSessionEstablishmentAccept(dlNasTransport *message.DLNASTransport) (message.GSMMessage, error) {

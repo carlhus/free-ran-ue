@@ -102,6 +102,20 @@ type Ue struct {
 
 	pduSessionEstablishmentAccept
 
+	nasObserver                    NasObserver
+	establishmentRequestContainers []ie.OperatorContainer
+
+	// serializes uplink NAS after registration, which shares the uplink NAS COUNT
+	uplinkNasMtx sync.Mutex
+	// guards lastPti and pendingModificationRequests
+	smMtx sync.Mutex
+	// the PTI of the latest Modification Request
+	lastPti uint8
+	// plain 5GSM bytes of each Modification Request not yet answered, by PTI
+	pendingModificationRequests map[uint8][]byte
+	// closed when the downlink NAS dispatcher exits; nil until it starts
+	nasDispatcherDone chan struct{}
+
 	*logger.UeLogger
 }
 
@@ -204,8 +218,22 @@ func NewUe(config *model.UeConfig, logger *logger.UeLogger) *Ue {
 		downlink: make(chan []byte, 2),
 		stopped:  make(chan struct{}),
 
+		nasObserver:                 nopNasObserver{},
+		pendingModificationRequests: make(map[uint8][]byte),
+
 		UeLogger: logger,
 	}
+}
+
+// SetNasObserver sets the observer of the PDU session events. Call it before Start.
+func (u *Ue) SetNasObserver(observer NasObserver) {
+	u.nasObserver = observer
+}
+
+// SetEstablishmentRequestContainers sets the operator containers that the
+// Establishment Request carries in its ePCO. Call it before Start.
+func (u *Ue) SetEstablishmentRequestContainers(operatorContainers []ie.OperatorContainer) {
+	u.establishmentRequestContainers = operatorContainers
 }
 
 func (u *Ue) Start(ctx context.Context, wg *sync.WaitGroup) error {
@@ -251,8 +279,7 @@ func (u *Ue) Start(ctx context.Context, wg *sync.WaitGroup) error {
 		return err
 	}
 
-	// wait for RAN message
-	go u.waitForRanMessage(ctx, wg)
+	u.startNasDispatcher(ctx, wg)
 
 	u.UeLog.Infoln("UE started")
 	return nil
@@ -262,6 +289,11 @@ func (u *Ue) Stop() {
 	u.UeLog.Infof("Stopping UE: imsi-%s", u.supi)
 
 	close(u.stopped)
+
+	// deregistration reads its accept itself, so the dispatcher must not race it for downlink NAS
+	if u.nasDispatcherDone != nil {
+		<-u.nasDispatcherDone
+	}
 
 	if err := u.processUeDeregistration(); err != nil {
 		u.UeLog.Errorf("Error processing UE deregistration: %v", err)
@@ -491,7 +523,7 @@ func (u *Ue) processPduSessionEstablishment() error {
 	u.PduLog.Infoln("Processing PDU session establishment")
 
 	// send pdu session establishment request
-	pduSessionEstablishmentRequest, err := getPduSessionEstablishmentRequest(constant.PDU_SESSION_ID)
+	pduSessionEstablishmentRequest, err := getPduSessionEstablishmentRequest(constant.PDU_SESSION_ID, u.establishmentRequestContainers)
 	if err != nil {
 		return fmt.Errorf("error get pdu session establishment request: %+v", err)
 	}
@@ -541,13 +573,16 @@ func (u *Ue) processUeDeregistration() error {
 	deregistrationRequest := getUeDeRegistrationRequest(ie.AccessType_3gpp, 0x00, ie.NASKeyNA, mobileIdentity5GS)
 	u.NasLog.Tracef("Get UE deregistration request: %+v", deregistrationRequest)
 
+	u.uplinkNasMtx.Lock()
 	encodedDeregistrationRequest, err := nasEncode(deregistrationRequest, u.secCtx, message.SecHdrTypeIntegrityProtectedAndCiphered)
 	if err != nil {
+		u.uplinkNasMtx.Unlock()
 		return fmt.Errorf("error encode ue deregistration request: %+v", err)
 	}
 	u.NasLog.Tracef("Encoded UE deregistration request: %+v", encodedDeregistrationRequest)
 
 	n, err := u.ranControlPlaneConn.Write(encodedDeregistrationRequest)
+	u.uplinkNasMtx.Unlock()
 	if err != nil {
 		return fmt.Errorf("error send ue deregistration request: %+v", err)
 	}
@@ -600,6 +635,8 @@ func (u *Ue) extractUeInformationFromNasPduSessionEstablishmentAccept(dlNasTrans
 			}
 		}
 		u.PduLog.Infof("PDU session SNSSAI, sst: %d, sd: %s", u.pduSessionEstablishmentAccept.sst, fmt.Sprintf("%x%x%x", u.pduSessionEstablishmentAccept.sd[0], u.pduSessionEstablishmentAccept.sd[1], u.pduSessionEstablishmentAccept.sd[2]))
+
+		u.nasObserver.PduSessionEstablishmentAccepted(operatorContainersFromNw(pduSessionEstablishmentAccept.ExtendedProtCfgOpts))
 	case *message.PDUSessRelCmd:
 		return fmt.Errorf("not implemented: PDUSessionReleaseCommand")
 	case *message.PDUSessEstRej:
@@ -611,28 +648,44 @@ func (u *Ue) extractUeInformationFromNasPduSessionEstablishmentAccept(dlNasTrans
 	return nil
 }
 
-func (u *Ue) waitForRanMessage(ctx context.Context, wg *sync.WaitGroup) {
-	u.RanLog.Infoln("Waiting for RAN message")
+// startNasDispatcher reads downlink messages from the RAN control plane until
+// ctx is done or Stop is called.
+func (u *Ue) startNasDispatcher(ctx context.Context, wg *sync.WaitGroup) {
+	u.nasDispatcherDone = make(chan struct{})
 	wg.Add(1)
+	go u.dispatchRanMessages(ctx, wg)
+}
+
+func (u *Ue) dispatchRanMessages(ctx context.Context, wg *sync.WaitGroup) {
+	u.RanLog.Infoln("Waiting for RAN message")
 	defer wg.Done()
+	defer close(u.nasDispatcherDone)
 
 	stopWatch := make(chan struct{})
 	defer close(stopWatch)
 	go func() {
 		select {
 		case <-ctx.Done():
-			if err := u.ranControlPlaneConn.SetReadDeadline(time.Now()); err != nil {
-				u.RanLog.Errorf("Error set read deadline: %+v", err)
-			}
+		case <-u.stopped:
 		case <-stopWatch:
+			return
+		}
+		if err := u.ranControlPlaneConn.SetReadDeadline(time.Now()); err != nil {
+			u.RanLog.Errorf("Error set read deadline: %+v", err)
 		}
 	}()
 
-	buffer := make([]byte, 1024)
+	buffer := make([]byte, constant.NAS_MESSAGE_BUFFER_SIZE)
 	for {
 		n, err := u.ranControlPlaneConn.Read(buffer)
 		if err != nil {
-			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF) {
+			if ctx.Err() != nil || u.isStopping() {
+				break
+			}
+			if errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF) {
+				// the gNB closes the control connection when it releases the UE context
+				u.RanLog.Infoln("RAN closed the control connection")
+				u.nasObserver.UeContextReleased()
 				break
 			}
 			u.RanLog.Warnf("Error read from ran control plane: %+v", err)
@@ -643,7 +696,9 @@ func (u *Ue) waitForRanMessage(ctx context.Context, wg *sync.WaitGroup) {
 		case constant.UE_TUNNEL_UPDATE:
 			go u.updateDataPlane()
 		default:
-			u.RanLog.Warnf("Received unknown message from RAN: %+v", buffer[:n])
+			if err := u.handleDownlinkNas(buffer[:n]); err != nil {
+				u.NasLog.Warnf("Error handle downlink NAS: %+v", err)
+			}
 		}
 	}
 
@@ -651,6 +706,144 @@ func (u *Ue) waitForRanMessage(ctx context.Context, wg *sync.WaitGroup) {
 		u.RanLog.Errorf("Error set read deadline: %+v", err)
 	}
 	u.RanLog.Infoln("Stop waiting for RAN message")
+}
+
+func (u *Ue) isStopping() bool {
+	select {
+	case <-u.stopped:
+		return true
+	default:
+		return false
+	}
+}
+
+// handleDownlinkNas dispatches a downlink NAS message by its type.
+func (u *Ue) handleDownlinkNas(payload []byte) error {
+	nasPdu, err := nasDecode(u, payload)
+	if err != nil {
+		return fmt.Errorf("error decode downlink NAS: %+v", err)
+	}
+
+	dlNasTransport, ok := nasPdu.(*message.DLNASTransport)
+	if !ok {
+		u.NasLog.Warnf("Ignore downlink NAS %T", nasPdu)
+		return nil
+	}
+	if dlNasTransport.PayloadCntr == nil || dlNasTransport.PayloadCntrType == nil ||
+		dlNasTransport.PayloadCntrType.Value != ie.PayloadCntrType_N1SMInfo {
+		u.NasLog.Warnln("Ignore DL NAS Transport without 5GSM payload")
+		return nil
+	}
+	gsmMessage, err := message.ParseGSM(dlNasTransport.PayloadCntr.Contents)
+	if err != nil {
+		return fmt.Errorf("error decode 5GSM message: %+v", err)
+	}
+	u.NasLog.Debugf("Receive 5GSM %T from RAN", gsmMessage)
+
+	switch gsm := gsmMessage.(type) {
+	case *message.PDUSessModCmd:
+		u.resolveModificationRequest(gsm.PTI)
+		reply := u.nasObserver.PduSessionModificationCommand(gsm.PTI, operatorContainersFromNw(gsm.ExtendedProtCfgOpts))
+		var answer []byte
+		if reply.Reject {
+			answer, err = buildPduSessionModificationCommandReject(gsm.PDUSessId, gsm.PTI, reply.Cause)
+		} else {
+			answer, err = buildPduSessionModificationComplete(gsm.PDUSessId, gsm.PTI)
+		}
+		if err != nil {
+			return fmt.Errorf("error build modification command answer: %+v", err)
+		}
+		return u.sendUplinkSm(answer, gsm.PDUSessId)
+	case *message.PDUSessModRej:
+		u.resolveModificationRequest(gsm.PTI)
+		u.nasObserver.PduSessionModificationRejected(gsm.PTI, cause5gsmValue(gsm.Cause5GSM), operatorContainersFromNw(gsm.ExtendedProtCfgOpts))
+		return nil
+	case *message.PDUSessRelCmd:
+		releaseComplete, err := buildPduSessionReleaseComplete(gsm.PDUSessId, gsm.PTI)
+		if err != nil {
+			return fmt.Errorf("error build release complete: %+v", err)
+		}
+		if err := u.sendUplinkSm(releaseComplete, gsm.PDUSessId); err != nil {
+			return err
+		}
+		u.nasObserver.PduSessionReleased(cause5gsmValue(gsm.Cause5GSM))
+		return nil
+	default:
+		u.NasLog.Warnf("Ignore 5GSM %T", gsmMessage)
+		return nil
+	}
+}
+
+// sendUplinkSm sends a 5GSM message of an established PDU session in an UL NAS Transport.
+func (u *Ue) sendUplinkSm(gsmPayload []byte, pduSessionId uint8) error {
+	u.uplinkNasMtx.Lock()
+	defer u.uplinkNasMtx.Unlock()
+
+	encoded, err := nasEncode(buildUlNasTransportForPduSession(gsmPayload, pduSessionId), u.secCtx, message.SecHdrTypeIntegrityProtectedAndCiphered)
+	if err != nil {
+		return fmt.Errorf("error encode ul nas transport: %+v", err)
+	}
+	n, err := u.ranControlPlaneConn.Write(encoded)
+	if err != nil {
+		return fmt.Errorf("error send ul nas transport: %+v", err)
+	}
+	u.NasLog.Tracef("Sent %d bytes of UL NAS transport to RAN", n)
+	return nil
+}
+
+// SendPduSessionModificationRequest sends a PDU Session Modification Request that
+// carries the operator containers in its ePCO, under a new PTI, which it returns.
+// The request can be resent under the same PTI until a Modification Command or
+// Reject answers it, also when sending it returned an error.
+func (u *Ue) SendPduSessionModificationRequest(operatorContainers []ie.OperatorContainer) (uint8, error) {
+	u.smMtx.Lock()
+	pti, err := u.allocatePti()
+	if err != nil {
+		u.smMtx.Unlock()
+		return 0, err
+	}
+	modificationRequest, err := buildPduSessionModificationRequest(constant.PDU_SESSION_ID, pti, operatorContainers)
+	if err != nil {
+		u.smMtx.Unlock()
+		return 0, fmt.Errorf("error build pdu session modification request: %+v", err)
+	}
+	u.pendingModificationRequests[pti] = modificationRequest
+	u.smMtx.Unlock()
+
+	u.NasLog.Debugf("Send PDU Session Modification Request with PTI %d", pti)
+	return pti, u.sendUplinkSm(modificationRequest, constant.PDU_SESSION_ID)
+}
+
+// ResendPduSessionModificationRequest resends the unanswered Modification Request with that PTI.
+func (u *Ue) ResendPduSessionModificationRequest(pti uint8) error {
+	u.smMtx.Lock()
+	modificationRequest, ok := u.pendingModificationRequests[pti]
+	u.smMtx.Unlock()
+	if !ok {
+		return fmt.Errorf("no unanswered modification request with PTI %d", pti)
+	}
+
+	u.NasLog.Debugf("Resend PDU Session Modification Request with PTI %d", pti)
+	return u.sendUplinkSm(modificationRequest, constant.PDU_SESSION_ID)
+}
+
+// allocatePti returns the next UE-allocated PTI (1-254, TS 24.007) not held by an
+// unanswered request. The caller holds smMtx.
+func (u *Ue) allocatePti() (uint8, error) {
+	for range 254 {
+		u.lastPti = u.lastPti%254 + 1
+		if _, pending := u.pendingModificationRequests[u.lastPti]; !pending {
+			return u.lastPti, nil
+		}
+	}
+	return 0, errors.New("every PTI is held by an unanswered modification request")
+}
+
+func (u *Ue) resolveModificationRequest(pti uint8) {
+	u.smMtx.Lock()
+	defer u.smMtx.Unlock()
+
+	delete(u.pendingModificationRequests, pti)
 }
 
 func (u *Ue) startDataPlane(ctx context.Context, wg *sync.WaitGroup) error {
@@ -717,6 +910,7 @@ func (u *Ue) startReadFromRan() {
 					return
 				}
 				u.RanLog.Errorf("Error read from ran data plane: %+v", err)
+				u.nasObserver.DataPlaneError(err)
 				return
 			}
 
@@ -802,6 +996,7 @@ func (u *Ue) handleDataPlane(ctx context.Context, wg *sync.WaitGroup) {
 						goto HANDLE_DATA_PLANE_FINISH
 					}
 					u.RanLog.Warnf("Error sent to ran data plane: %+v", err)
+					u.nasObserver.DataPlaneError(err)
 				}
 				u.RanLog.Tracef("Sent %d bytes of data to RAN: %+v", n, buffer[:n])
 			} else {
@@ -812,6 +1007,7 @@ func (u *Ue) handleDataPlane(ctx context.Context, wg *sync.WaitGroup) {
 							goto HANDLE_DATA_PLANE_FINISH
 						}
 						u.RanLog.Warnf("Error sent to dc ran data plane: %+v", err)
+						u.nasObserver.DataPlaneError(err)
 					}
 					u.RanLog.Tracef("Sent %d bytes of data to DC RAN: %+v", n, buffer[:n])
 				} else {
@@ -821,6 +1017,7 @@ func (u *Ue) handleDataPlane(ctx context.Context, wg *sync.WaitGroup) {
 							goto HANDLE_DATA_PLANE_FINISH
 						}
 						u.RanLog.Warnf("Error sent to ran data plane: %+v", err)
+						u.nasObserver.DataPlaneError(err)
 					}
 					u.RanLog.Tracef("Sent %d bytes of data to RAN: %+v", n, buffer[:n])
 				}

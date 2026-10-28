@@ -474,3 +474,25 @@ func TestBuildPDUSessionResourceModifyIndicationTransfer(t *testing.T) {
 		})
 	}
 }
+
+func TestPduSessionResourceResponsesDecode(t *testing.T) {
+	modifyResponse, err := getPduSessionResourceModifyResponse(7, 3, []int64{1})
+	assert.NoError(t, err)
+	decoded, err := message.Parse(modifyResponse)
+	assert.NoError(t, err)
+	modify, ok := decoded.(*message.PDUSessionResourceModifyResponse)
+	assert.True(t, ok)
+	assert.Equal(t, int64(7), modify.AMFUENGAPID.Value)
+	assert.Equal(t, int64(3), modify.RANUENGAPID.Value)
+	assert.Equal(t, int64(1), modify.PDUSessionResourceModifyListModRes.List[0].PDUSessionID.Value)
+
+	releaseResponse, err := getPduSessionResourceReleaseResponse(7, 3, []int64{1})
+	assert.NoError(t, err)
+	decoded, err = message.Parse(releaseResponse)
+	assert.NoError(t, err)
+	release, ok := decoded.(*message.PDUSessionResourceReleaseResponse)
+	assert.True(t, ok)
+	assert.Equal(t, int64(7), release.AMFUENGAPID.Value)
+	assert.Equal(t, int64(3), release.RANUENGAPID.Value)
+	assert.Equal(t, int64(1), release.PDUSessionResourceReleasedListRelRes.List[0].PDUSessionID.Value)
+}
