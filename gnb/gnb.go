@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"strconv"
@@ -73,6 +74,8 @@ type Gnb struct {
 	plmnId ie.PLMNIdentity
 	tai    ie.TAI
 	snssai ie.SNSSAI
+
+	ratInformation *ie.RATInformation
 
 	staticNrdc bool
 
@@ -143,6 +146,12 @@ func NewGnb(config *model.GnbConfig, gnbLogger *logger.GnbLogger) *Gnb {
 		return nil
 	}
 
+	ratInformation, err := ratInformationToNgap(config.Gnb.RatInformation)
+	if err != nil {
+		gnbLogger.CfgLog.Errorf("Error converting ratInformation to ngap: %v", err)
+		return nil
+	}
+
 	return &Gnb{
 		amfN2Ip:           config.Gnb.AmfN2Ip,
 		ranN2Ip:           config.Gnb.RanN2Ip,
@@ -164,6 +173,8 @@ func NewGnb(config *model.GnbConfig, gnbLogger *logger.GnbLogger) *Gnb {
 		plmnId: plmnId,
 		tai:    tai,
 		snssai: snssai,
+
+		ratInformation: ratInformation,
 
 		staticNrdc: config.Gnb.StaticNrdc,
 		xnInterface: xnInterface{
@@ -453,7 +464,7 @@ func (g *Gnb) connectToUpf() error {
 func (g *Gnb) setupN2() error {
 	g.RanLog.Infoln("Setting up N2")
 
-	request, err := getNgapSetupRequest(g.gnbId, g.gnbName, g.plmnId, g.tai, g.snssai)
+	request, err := getNgapSetupRequest(g.gnbId, g.gnbName, g.plmnId, g.tai, g.snssai, g.ratInformation)
 	if err != nil {
 		return fmt.Errorf("error getting NGAP setup request: %v", err)
 	}
@@ -536,11 +547,29 @@ func (g *Gnb) setupN1(ranUe *RanUe) error {
 	return nil
 }
 
-func (g *Gnb) releaseN1(ranUe *RanUe) error {
-	g.RanLog.Infoln("Waiting for UE to release N1")
+// relayN1UntilRelease relays every uplink NAS of an established UE to the AMF,
+// whatever its type, until the UE context is released or the UE closes N1.
+// A deregistering UE closes N1 once it has the Deregistration Accept, which may
+// be before the AMF releases its context, so the gNB then waits for the release.
+func (g *Gnb) relayN1UntilRelease(ranUe *RanUe) error {
+	g.RanLog.Infoln("Relaying uplink NAS until UE context release")
 
-	if err := g.processUeDeRegistration(ranUe); err != nil {
-		return fmt.Errorf("error processing UE deregistration: %v", err)
+	for {
+		err := g.relayUplinkNas(ranUe, "uplink NAS")
+		if err == nil {
+			continue
+		}
+		if errors.Is(err, net.ErrClosed) {
+			// closed by the UE context release, or by the gNB stopping
+			break
+		}
+		if !errors.Is(err, io.EOF) {
+			return err
+		}
+		if err := util.WaitComplete(ranUe.GetUeContextReleaseCompleteChan(), 10*time.Second); err != nil {
+			return fmt.Errorf("error waiting for ue context release to complete: %v", err)
+		}
+		break
 	}
 
 	g.RanLog.Infoln("N1 released")
@@ -614,7 +643,8 @@ func (g *Gnb) startRanDataPlaneServer() error {
 
 func (g *Gnb) handleRanConnection(ctx context.Context, ranUe *RanUe) {
 	defer func() {
-		if err := ranUe.GetN1Conn().Close(); err != nil {
+		// releasing the UE context closes N1 first
+		if err := ranUe.GetN1Conn().Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 			g.RanLog.Errorf("Error closing UE connection: %v", err)
 		}
 		g.RanLog.Infof("Closed UE connection from: %v", ranUe.GetN1Conn().RemoteAddr())
@@ -630,7 +660,7 @@ func (g *Gnb) handleRanConnection(ctx context.Context, ranUe *RanUe) {
 	}
 	g.GtpLog.Debugf("DL TEID: %s, UL TEID: %s", hex.EncodeToString(ranUe.GetDlTeid()), hex.EncodeToString(ranUe.GetUlTeid()))
 
-	if err := g.releaseN1(ranUe); err != nil {
+	if err := g.relayN1UntilRelease(ranUe); err != nil {
 		g.RanLog.Errorf("Error releasing N1: %v", err)
 		return
 	}
@@ -737,10 +767,10 @@ func (g *Gnb) handleUeDataPlanePacket(ueAddress *net.UDPAddr, buffer []byte) {
 }
 
 func (g *Gnb) relayUplinkNas(ranUe *RanUe, label string) error {
-	buf := make([]byte, 1024)
+	buf := make([]byte, constant.NAS_MESSAGE_BUFFER_SIZE)
 	n, err := ranUe.GetN1Conn().Read(buf)
 	if err != nil {
-		return fmt.Errorf("error receive %s from UE: %v", label, err)
+		return fmt.Errorf("error receive %s from UE: %w", label, err)
 	}
 	g.NasLog.Tracef("Received %d bytes of %s from UE", n, label)
 	g.NasLog.Debugf("Receive %s from UE", label)
@@ -868,22 +898,6 @@ func (g *Gnb) processUePduSessionModifyIndication(ranUe *RanUe) error {
 		return fmt.Errorf("error waiting for pdu session modify indication to complete: %v", err)
 	}
 	g.NgapLog.Infof("UE %s PDU session modify indication completed", ranUe.GetMobileIdentityIMSI())
-	return nil
-}
-
-func (g *Gnb) processUeDeRegistration(ranUe *RanUe) error {
-	g.RanLog.Infoln("Waiting for UE to deregister")
-
-	// receive ue deregistration request from UE and send to AMF
-	if err := g.relayUplinkNas(ranUe, "UE Deregistration Request"); err != nil {
-		return err
-	}
-
-	// wait dispatcher to receive ue deregistration accept from AMF
-	if err := util.WaitComplete(ranUe.GetUeContextReleaseCompleteChan(), 10*time.Second); err != nil {
-		return fmt.Errorf("error waiting for ue context release to complete: %v", err)
-	}
-	g.RanLog.Infoln("UE deregistration complete")
 	return nil
 }
 

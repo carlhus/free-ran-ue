@@ -30,6 +30,10 @@ type GnbIE struct {
 	Tai    TaiIE    `yaml:"tai" valid:"required"`
 	Snssai SnssaiIE `yaml:"snssai" valid:"required"`
 
+	// RatInformation is advertised on the Supported TA in NG Setup when set:
+	// NR_LEO, NR_MEO, NR_GEO or NR_OTHER_SAT.
+	RatInformation string `yaml:"ratInformation"`
+
 	StaticNrdc bool `yaml:"staticNrdc"`
 
 	XnInterface XnInterfaceIE `yaml:"xnInterface"`

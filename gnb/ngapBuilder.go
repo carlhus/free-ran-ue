@@ -71,7 +71,44 @@ func buildUserLocationInformationNR(plmnId ie.PLMNIdentity, tai ie.TAI, gnbId []
 	}
 }
 
-func buildNgapSetupRequest(gnbId []byte, gnbName string, plmnId ie.PLMNIdentity, tai ie.TAI, snssai ie.SNSSAI) *message.NGSetupRequest {
+var ratInformationValues = map[string]aper.Enumerated{
+	"NR_LEO":       ie.RATInformationPresentNRLEO,
+	"NR_MEO":       ie.RATInformationPresentNRMEO,
+	"NR_GEO":       ie.RATInformationPresentNRGEO,
+	"NR_OTHER_SAT": ie.RATInformationPresentNROTHERSAT,
+}
+
+// ratInformationToNgap returns nil for an empty name, so a gNB without
+// ratInformation keeps sending a plain Supported TA.
+func ratInformationToNgap(name string) (*ie.RATInformation, error) {
+	if name == "" {
+		return nil, nil
+	}
+	value, ok := ratInformationValues[name]
+	if !ok {
+		return nil, fmt.Errorf("unknown ratInformation %q", name)
+	}
+	return &ie.RATInformation{Value: value}, nil
+}
+
+// buildSupportedTAItemExtensions carries the gNB's RAT Information (TS 38.413)
+// on a Supported TA, or nothing when the gNB has none configured.
+func buildSupportedTAItemExtensions(ratInformation *ie.RATInformation) *ie.ProtocolExtensionContainerSupportedTAItemExtIEs {
+	if ratInformation == nil {
+		return nil
+	}
+	return &ie.ProtocolExtensionContainerSupportedTAItemExtIEs{
+		List: []ie.SupportedTAItemExtIEs{
+			{
+				Id:             &ie.ProtocolExtensionID{Value: ie.ProtocolIEIDRATInformation},
+				Criticality:    &ie.Criticality{Value: ie.CriticalityPresentReject},
+				RATInformation: ratInformation,
+			},
+		},
+	}
+}
+
+func buildNgapSetupRequest(gnbId []byte, gnbName string, plmnId ie.PLMNIdentity, tai ie.TAI, snssai ie.SNSSAI, ratInformation *ie.RATInformation) *message.NGSetupRequest {
 	return &message.NGSetupRequest{
 		GlobalRANNodeID: &ie.GlobalRANNodeID{
 			Choice: &ie.GlobalGNBID{
@@ -105,6 +142,7 @@ func buildNgapSetupRequest(gnbId []byte, gnbName string, plmnId ie.PLMNIdentity,
 							},
 						},
 					},
+					IEExtensions: buildSupportedTAItemExtensions(ratInformation),
 				},
 			},
 		},
@@ -114,8 +152,8 @@ func buildNgapSetupRequest(gnbId []byte, gnbName string, plmnId ie.PLMNIdentity,
 	}
 }
 
-func getNgapSetupRequest(gnbId []byte, gnbName string, plmnId ie.PLMNIdentity, tai ie.TAI, snssai ie.SNSSAI) ([]byte, error) {
-	return buildNgapSetupRequest(gnbId, gnbName, plmnId, tai, snssai).MarshalBinary()
+func getNgapSetupRequest(gnbId []byte, gnbName string, plmnId ie.PLMNIdentity, tai ie.TAI, snssai ie.SNSSAI, ratInformation *ie.RATInformation) ([]byte, error) {
+	return buildNgapSetupRequest(gnbId, gnbName, plmnId, tai, snssai, ratInformation).MarshalBinary()
 }
 
 func buildInitialUeMessage(ranUeNgapId int64, ueRegistrationRequest []byte, plmnId ie.PLMNIdentity, tai ie.TAI, gnbId []byte) *message.InitialUEMessage {
@@ -274,6 +312,60 @@ func buildNgapUeContextReleaseCompleteMessage(amfUeNgapId, ranUeNgapId int64, pd
 
 func getNgapUeContextReleaseCompleteMessage(amfUeNgapId, ranUeNgapId int64, pduSessionIdList []int64, plmnId ie.PLMNIdentity, tai ie.TAI, gnbId []byte) ([]byte, error) {
 	return buildNgapUeContextReleaseCompleteMessage(amfUeNgapId, ranUeNgapId, pduSessionIdList, plmnId, tai, gnbId).MarshalBinary()
+}
+
+func buildPduSessionResourceModifyResponse(amfUeNgapId, ranUeNgapId int64, pduSessionIds []int64, pduSessionResourceModifyResponseTransferMessage []byte) *message.PDUSessionResourceModifyResponse {
+	response := &message.PDUSessionResourceModifyResponse{
+		AMFUENGAPID: &ie.AMFUENGAPID{Value: amfUeNgapId},
+		RANUENGAPID: &ie.RANUENGAPID{Value: ranUeNgapId},
+	}
+	if len(pduSessionIds) == 0 {
+		return response
+	}
+
+	response.PDUSessionResourceModifyListModRes = &ie.PDUSessionResourceModifyListModRes{}
+	for _, pduSessionId := range pduSessionIds {
+		transfer := aper.OctetString(pduSessionResourceModifyResponseTransferMessage)
+		response.PDUSessionResourceModifyListModRes.List = append(response.PDUSessionResourceModifyListModRes.List, ie.PDUSessionResourceModifyItemModRes{
+			PDUSessionID:                             &ie.PDUSessionID{Value: pduSessionId},
+			PDUSessionResourceModifyResponseTransfer: &transfer,
+		})
+	}
+	return response
+}
+
+// getPduSessionResourceModifyResponse reports each session modified with an empty transfer.
+func getPduSessionResourceModifyResponse(amfUeNgapId, ranUeNgapId int64, pduSessionIds []int64) ([]byte, error) {
+	transfer, err := ie.MarshalBinary(&ie.PDUSessionResourceModifyResponseTransfer{})
+	if err != nil {
+		return nil, fmt.Errorf("error marshal pdu session resource modify response transfer: %v", err)
+	}
+	return buildPduSessionResourceModifyResponse(amfUeNgapId, ranUeNgapId, pduSessionIds, transfer).MarshalBinary()
+}
+
+func buildPduSessionResourceReleaseResponse(amfUeNgapId, ranUeNgapId int64, pduSessionIds []int64, pduSessionResourceReleaseResponseTransferMessage []byte) *message.PDUSessionResourceReleaseResponse {
+	response := &message.PDUSessionResourceReleaseResponse{
+		AMFUENGAPID:                          &ie.AMFUENGAPID{Value: amfUeNgapId},
+		RANUENGAPID:                          &ie.RANUENGAPID{Value: ranUeNgapId},
+		PDUSessionResourceReleasedListRelRes: &ie.PDUSessionResourceReleasedListRelRes{},
+	}
+	for _, pduSessionId := range pduSessionIds {
+		transfer := aper.OctetString(pduSessionResourceReleaseResponseTransferMessage)
+		response.PDUSessionResourceReleasedListRelRes.List = append(response.PDUSessionResourceReleasedListRelRes.List, ie.PDUSessionResourceReleasedItemRelRes{
+			PDUSessionID: &ie.PDUSessionID{Value: pduSessionId},
+			PDUSessionResourceReleaseResponseTransfer: &transfer,
+		})
+	}
+	return response
+}
+
+// getPduSessionResourceReleaseResponse reports each session released with an empty transfer.
+func getPduSessionResourceReleaseResponse(amfUeNgapId, ranUeNgapId int64, pduSessionIds []int64) ([]byte, error) {
+	transfer, err := ie.MarshalBinary(&ie.PDUSessionResourceReleaseResponseTransfer{})
+	if err != nil {
+		return nil, fmt.Errorf("error marshal pdu session resource release response transfer: %v", err)
+	}
+	return buildPduSessionResourceReleaseResponse(amfUeNgapId, ranUeNgapId, pduSessionIds, transfer).MarshalBinary()
 }
 
 func buildPDUSessionResourceModifyIndicationTransfer(dlTeid []byte, ranN3Ip string, qosId int64) ie.PDUSessionResourceModifyIndicationTransfer {

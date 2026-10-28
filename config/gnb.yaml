@@ -32,6 +32,8 @@ gnb:
     sst: "1" # Slice/Service Type
     sd: "010203" # Slice Differentiator
 
+  # ratInformation: "NR_LEO" # Optional RAT Information on the Supported TA: NR_LEO, NR_MEO, NR_GEO, NR_OTHER_SAT
+
   api:
     ip: "10.0.1.2" # API for console usage
     port: 40104 # API port for console usage

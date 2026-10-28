@@ -12,6 +12,8 @@ type UeIE struct {
 	RanDataPlaneIp    string `yaml:"ranDataPlaneIp" valid:"required"`
 	LocalDataPlaneIp  string `yaml:"localDataPlaneIp"`
 
+	LocalControlPlaneIp string `yaml:"localControlPlaneIp"`
+
 	RanControlPlanePort int `yaml:"ranControlPlanePort" valid:"required"`
 	RanDataPlanePort    int `yaml:"ranDataPlanePort" valid:"required"`
 
@@ -28,8 +30,12 @@ type UeIE struct {
 
 	Nrdc NrdcIE `yaml:"nrdc"`
 
-	UeTunnelDevice    string `yaml:"ueTunnelDevice" valid:"required"`
-	IgnoreSetupTunnel bool   `yaml:"ignoreSetupTunnel" valid:"required"`
+	UeTunnelDevice string `yaml:"ueTunnelDevice" valid:"required"`
+
+	// ExternalDataPlane is set by a process that embeds the UE: no TUN is
+	// created, and the process moves packets through Ue.UplinkPackets and
+	// Ue.DownlinkPackets instead.
+	ExternalDataPlane bool `yaml:"-"`
 }
 
 type AuthenticationSubscriptionIE struct {

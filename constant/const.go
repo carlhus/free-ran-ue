@@ -28,6 +28,9 @@ const (
 	UE_DATA_PLANE_INITIAL_PACKET = "initial packet"
 	UE_TUNNEL_UPDATE             = "tunnel update"
 	UE_IMSI_PREFIX               = "imsi-"
+
+	// one read on N1 or N2 holds a whole message, which ePCO containers can make large
+	NAS_MESSAGE_BUFFER_SIZE = 65535
 )
 
 // for logger

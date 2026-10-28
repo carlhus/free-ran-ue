@@ -16,7 +16,7 @@ type ngapDispatcher struct{}
 
 func (d *ngapDispatcher) start(g *Gnb) {
 	g.NgapLog.Infoln("NGAP dispatcher started")
-	ngapBuffer := make([]byte, 1024)
+	ngapBuffer := make([]byte, constant.NAS_MESSAGE_BUFFER_SIZE)
 	for {
 		n, err := g.n2Conn.Read(ngapBuffer)
 		if err != nil {
@@ -53,6 +53,12 @@ func (d *ngapDispatcher) dispatch(g *Gnb, ngapRaw []byte) {
 	case *message.PDUSessionResourceSetupRequest:
 		g.NgapLog.Debugln("Processing NGAP PDU Session Resource Setup")
 		d.pduSessionResourceSetupProcessor(g, msg, ngapRaw)
+	case *message.PDUSessionResourceModifyRequest:
+		g.NgapLog.Debugln("Processing NGAP PDU Session Resource Modify Request")
+		d.pduSessionResourceModifyRequestProcessor(g, msg)
+	case *message.PDUSessionResourceReleaseCommand:
+		g.NgapLog.Debugln("Processing NGAP PDU Session Resource Release Command")
+		d.pduSessionResourceReleaseCommandProcessor(g, msg)
 	case *message.UEContextReleaseCommand:
 		g.NgapLog.Debugln("Processing NGAP UE Context Release")
 		d.ueContextReleaseProcessor(g, msg)
@@ -284,6 +290,107 @@ func (d *ngapDispatcher) ueContextReleaseProcessor(g *Gnb, msg *message.UEContex
 	g.NgapLog.Debugln("Send ngap ue context release complete message to AMF")
 
 	util.SignalComplete(ranUe.GetUeContextReleaseCompleteChan())
+
+	// like an RRC release: the UE sees the control connection close
+	if err := ranUe.GetN1Conn().Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		g.NgapLog.Errorf("Error closing UE connection: %v", err)
+	}
+}
+
+// pduSessionResourceModifyRequestProcessor forwards the NAS PDU of each session to the UE
+// and reports every session modified, since the gNB keeps no per-QoS-flow state to change.
+func (d *ngapDispatcher) pduSessionResourceModifyRequestProcessor(g *Gnb, msg *message.PDUSessionResourceModifyRequest) {
+	if msg.AMFUENGAPID == nil || msg.RANUENGAPID == nil || msg.PDUSessionResourceModifyListModReq == nil {
+		g.NgapLog.Errorf("Error pdu session resource modify request: missing mandatory IE")
+		return
+	}
+
+	ranUe, ok := d.loadRanUe(g, msg.AMFUENGAPID.Value, msg.RANUENGAPID.Value, "pdu session resource modify request")
+	if !ok {
+		return
+	}
+
+	pduSessionIds := make([]int64, 0, len(msg.PDUSessionResourceModifyListModReq.List))
+	for _, item := range msg.PDUSessionResourceModifyListModReq.List {
+		if item.PDUSessionID == nil {
+			continue
+		}
+		pduSessionIds = append(pduSessionIds, item.PDUSessionID.Value)
+		if item.NASPDU != nil {
+			d.forwardNasPdu(g, ranUe, item.NASPDU.Value, "pdu session resource modify request")
+		}
+	}
+
+	response, err := getPduSessionResourceModifyResponse(ranUe.GetAmfUeId(), ranUe.GetRanUeId(), pduSessionIds)
+	if err != nil {
+		g.NgapLog.Errorf("Error get pdu session resource modify response: %v", err)
+		return
+	}
+	if _, err := g.n2Conn.Write(response); err != nil {
+		g.NgapLog.Errorf("Error send pdu session resource modify response to AMF: %v", err)
+		return
+	}
+	g.NgapLog.Debugln("Send pdu session resource modify response to AMF")
+}
+
+// pduSessionResourceReleaseCommandProcessor forwards the NAS PDU to the UE and reports the sessions released.
+func (d *ngapDispatcher) pduSessionResourceReleaseCommandProcessor(g *Gnb, msg *message.PDUSessionResourceReleaseCommand) {
+	if msg.AMFUENGAPID == nil || msg.RANUENGAPID == nil || msg.PDUSessionResourceToReleaseListRelCmd == nil {
+		g.NgapLog.Errorf("Error pdu session resource release command: missing mandatory IE")
+		return
+	}
+
+	ranUe, ok := d.loadRanUe(g, msg.AMFUENGAPID.Value, msg.RANUENGAPID.Value, "pdu session resource release command")
+	if !ok {
+		return
+	}
+
+	if msg.NASPDU != nil {
+		d.forwardNasPdu(g, ranUe, msg.NASPDU.Value, "pdu session resource release command")
+	}
+
+	pduSessionIds := make([]int64, 0, len(msg.PDUSessionResourceToReleaseListRelCmd.List))
+	for _, item := range msg.PDUSessionResourceToReleaseListRelCmd.List {
+		if item.PDUSessionID != nil {
+			pduSessionIds = append(pduSessionIds, item.PDUSessionID.Value)
+		}
+	}
+
+	response, err := getPduSessionResourceReleaseResponse(ranUe.GetAmfUeId(), ranUe.GetRanUeId(), pduSessionIds)
+	if err != nil {
+		g.NgapLog.Errorf("Error get pdu session resource release response: %v", err)
+		return
+	}
+	if _, err := g.n2Conn.Write(response); err != nil {
+		g.NgapLog.Errorf("Error send pdu session resource release response to AMF: %v", err)
+		return
+	}
+	g.NgapLog.Debugln("Send pdu session resource release response to AMF")
+}
+
+func (d *ngapDispatcher) loadRanUe(g *Gnb, amfUeNgapId, ranUeNgapId int64, label string) (*RanUe, bool) {
+	ueValue, exist := g.ranUeConns.Load(ranUeNgapId)
+	if !exist {
+		g.NgapLog.Errorf("Error %s: Ran UE with ranUeNgapId %d not found", label, ranUeNgapId)
+		return nil, false
+	}
+	ranUe := ueValue.(*RanUe)
+
+	if ranUe.GetAmfUeId() != amfUeNgapId {
+		g.NgapLog.Errorf("Error %s: Ran UE with ranUeNgapId %d has amfUeNgapId %d, expected %d", label, ranUeNgapId, ranUe.GetAmfUeId(), amfUeNgapId)
+		return nil, false
+	}
+	return ranUe, true
+}
+
+func (d *ngapDispatcher) forwardNasPdu(g *Gnb, ranUe *RanUe, nasPdu []byte, label string) {
+	n, err := ranUe.GetN1Conn().Write(nasPdu)
+	if err != nil {
+		g.NgapLog.Errorf("Error send %s NASPDU to UE: %v", label, err)
+		return
+	}
+	g.NgapLog.Tracef("Sent %d bytes of %s NASPDU to UE", n, label)
+	g.NgapLog.Debugf("Send %s NASPDU to UE %s", label, ranUe.GetMobileIdentityIMSI())
 }
 
 func (d *ngapDispatcher) pduSessionResourceModifyIndicationProcessor(g *Gnb, msg *message.PDUSessionResourceModifyConfirm, ngapRaw []byte) {

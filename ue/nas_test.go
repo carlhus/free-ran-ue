@@ -148,7 +148,7 @@ var testBuildPduSessionEstablishmentRequestCases = []struct {
 func TestBuildPduSessionEstablishmentRequest(t *testing.T) {
 	for _, testCase := range testBuildPduSessionEstablishmentRequestCases {
 		t.Run(testCase.name, func(t *testing.T) {
-			_, err := buildPduSessionEstablishmentRequest(testCase.pduSessionId)
+			_, err := buildPduSessionEstablishmentRequest(testCase.pduSessionId, nil)
 			assert.Equal(t, testCase.expectedError, err)
 		})
 	}
