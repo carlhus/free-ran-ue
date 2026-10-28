@@ -64,9 +64,10 @@ type nrdc struct {
 }
 
 type Ue struct {
-	ranControlPlaneIp string
-	ranDataPlaneIp    string
-	localDataPlaneIp  string
+	ranControlPlaneIp   string
+	ranDataPlaneIp      string
+	localDataPlaneIp    string
+	localControlPlaneIp string
 
 	ranControlPlanePort int
 	ranDataPlanePort    int
@@ -89,11 +90,15 @@ type Ue struct {
 	nrdc
 
 	ueTunnelDeviceName string
-	ignoreSetupTunnel  bool
+	externalDataPlane  bool
 	ueTunnelDevice     *water.Interface
 
-	readFromTun chan []byte
-	readFromRan chan []byte
+	// uplink packets from the TUN, or from the embedding process with an external data plane
+	uplink chan []byte
+	// downlink packets to the TUN, or to the embedding process with an external data plane
+	downlink chan []byte
+	// closed by Stop so the data plane goroutines exit
+	stopped chan struct{}
 
 	pduSessionEstablishmentAccept
 
@@ -139,9 +144,10 @@ func NewUe(config *model.UeConfig, logger *logger.UeLogger) *Ue {
 	}
 
 	return &Ue{
-		ranControlPlaneIp: config.Ue.RanControlPlaneIp,
-		ranDataPlaneIp:    config.Ue.RanDataPlaneIp,
-		localDataPlaneIp:  config.Ue.LocalDataPlaneIp,
+		ranControlPlaneIp:   config.Ue.RanControlPlaneIp,
+		ranDataPlaneIp:      config.Ue.RanDataPlaneIp,
+		localDataPlaneIp:    config.Ue.LocalDataPlaneIp,
+		localControlPlaneIp: config.Ue.LocalControlPlaneIp,
 
 		ranControlPlanePort: config.Ue.RanControlPlanePort,
 		ranDataPlanePort:    config.Ue.RanDataPlanePort,
@@ -192,7 +198,11 @@ func NewUe(config *model.UeConfig, logger *logger.UeLogger) *Ue {
 		},
 
 		ueTunnelDeviceName: config.Ue.UeTunnelDevice,
-		ignoreSetupTunnel:  config.Ue.IgnoreSetupTunnel,
+		externalDataPlane:  config.Ue.ExternalDataPlane,
+
+		uplink:   make(chan []byte),
+		downlink: make(chan []byte, 2),
+		stopped:  make(chan struct{}),
 
 		UeLogger: logger,
 	}
@@ -230,8 +240,8 @@ func (u *Ue) Start(ctx context.Context, wg *sync.WaitGroup) error {
 		return err
 	}
 
-	if err := u.setupTunnelDevice(); err != nil {
-		u.UeLog.Errorf("Error setting up tunnel device: %v", err)
+	if err := u.startDataPlane(ctx, wg); err != nil {
+		u.UeLog.Errorf("Error starting data plane: %v", err)
 		if err := u.ranDataPlaneConn.Close(); err != nil {
 			u.UeLog.Errorf("Error closing RAN connection: %v", err)
 		}
@@ -244,15 +254,14 @@ func (u *Ue) Start(ctx context.Context, wg *sync.WaitGroup) error {
 	// wait for RAN message
 	go u.waitForRanMessage(ctx, wg)
 
-	// handle data plane
-	go u.handleDataPlane(ctx, wg)
-
 	u.UeLog.Infoln("UE started")
 	return nil
 }
 
 func (u *Ue) Stop() {
 	u.UeLog.Infof("Stopping UE: imsi-%s", u.supi)
+
+	close(u.stopped)
 
 	if err := u.processUeDeregistration(); err != nil {
 		u.UeLog.Errorf("Error processing UE deregistration: %v", err)
@@ -284,7 +293,7 @@ func (u *Ue) connectToRanControlPlane() error {
 
 	u.RanLog.Tracef("RAN control plane address: %s:%d", u.ranControlPlaneIp, u.ranControlPlanePort)
 
-	conn, err := util.TcpDialWithOptionalLocalAddress(u.ranControlPlaneIp, u.ranControlPlanePort, "")
+	conn, err := util.TcpDialWithOptionalLocalAddress(u.ranControlPlaneIp, u.ranControlPlanePort, u.localControlPlaneIp)
 	if err != nil {
 		return err
 	}
@@ -644,11 +653,22 @@ func (u *Ue) waitForRanMessage(ctx context.Context, wg *sync.WaitGroup) {
 	u.RanLog.Infoln("Stop waiting for RAN message")
 }
 
+func (u *Ue) startDataPlane(ctx context.Context, wg *sync.WaitGroup) error {
+	if err := u.setupTunnelDevice(); err != nil {
+		return err
+	}
+
+	u.startReadFromRan()
+
+	go u.handleDataPlane(ctx, wg)
+	return nil
+}
+
 func (u *Ue) setupTunnelDevice() error {
 	u.TunLog.Infoln("Setting up UE tunnel device")
 
-	if u.ignoreSetupTunnel {
-		u.TunLog.Warnln("Ignore tunnel device, skip setup")
+	if u.externalDataPlane {
+		u.TunLog.Infoln("External data plane, skip tunnel device setup")
 		return nil
 	}
 
@@ -661,7 +681,6 @@ func (u *Ue) setupTunnelDevice() error {
 	u.ueTunnelDevice = waterInterface
 
 	// go routine for read data from TUN
-	u.readFromTun = make(chan []byte)
 	go func() {
 		buffer := make([]byte, 4096)
 		for {
@@ -677,13 +696,17 @@ func (u *Ue) setupTunnelDevice() error {
 
 			tmp := make([]byte, n)
 			copy(tmp, buffer[:n])
-			u.readFromTun <- tmp
+			u.uplink <- tmp
 		}
 	}()
 	u.TunLog.Debugln("Read from TUN started")
 
+	u.TunLog.Infof("UE tunnel device setup as %s", u.ueTunnelDeviceName)
+	return nil
+}
+
+func (u *Ue) startReadFromRan() {
 	// go routing for read data from RAN
-	u.readFromRan = make(chan []byte, 2)
 	go func() {
 		buffer := make([]byte, 4096)
 		for {
@@ -699,7 +722,11 @@ func (u *Ue) setupTunnelDevice() error {
 
 			tmp := make([]byte, n)
 			copy(tmp, buffer[:n])
-			u.readFromRan <- tmp
+			select {
+			case u.downlink <- tmp:
+			case <-u.stopped:
+				return
+			}
 		}
 	}()
 	u.TunLog.Debugln("Read from RAN started")
@@ -719,26 +746,28 @@ func (u *Ue) setupTunnelDevice() error {
 
 				tmp := make([]byte, n)
 				copy(tmp, buffer[:n])
-				u.readFromRan <- tmp
+				select {
+				case u.downlink <- tmp:
+				case <-u.stopped:
+					return
+				}
 			}
 		}()
 		u.TunLog.Debugln("Read from DC RAN data plane started")
 	}
-
-	u.TunLog.Infof("UE tunnel device setup as %s", u.ueTunnelDeviceName)
-	return nil
 }
 
 func (u *Ue) cleanUpTunnelDevice() error {
 	u.TunLog.Infoln("Cleaning up UE tunnel device")
 
-	if u.ignoreSetupTunnel {
-		u.TunLog.Warnln("Ignore tunnel device, skip cleanup")
+	if u.externalDataPlane {
+		// the channels stay open: the embedding process owns the uplink side
+		u.TunLog.Infoln("External data plane, skip tunnel device cleanup")
 		return nil
 	}
 
-	close(u.readFromTun)
-	close(u.readFromRan)
+	close(u.uplink)
+	close(u.downlink)
 
 	if err := bringDownUeTunnelDevice(u.ueTunnelDeviceName); err != nil {
 		return fmt.Errorf("error bring down ue tunnel device: %+v", err)
@@ -752,12 +781,20 @@ func (u *Ue) cleanUpTunnelDevice() error {
 func (u *Ue) handleDataPlane(ctx context.Context, wg *sync.WaitGroup) {
 	wg.Add(1)
 
+	// with an external data plane, the embedding process reads downlink packets itself
+	toTun := u.downlink
+	if u.externalDataPlane {
+		toTun = nil
+	}
+
 	// forward data from TUN to RAN and RAN to TUN
 	for {
 		select {
 		case <-ctx.Done():
 			goto HANDLE_DATA_PLANE_FINISH
-		case buffer := <-u.readFromTun:
+		case <-u.stopped:
+			goto HANDLE_DATA_PLANE_FINISH
+		case buffer := <-u.uplink:
 			if !u.isNrdcEnabled() {
 				n, err := u.ranDataPlaneConn.Write(buffer)
 				if err != nil {
@@ -788,7 +825,7 @@ func (u *Ue) handleDataPlane(ctx context.Context, wg *sync.WaitGroup) {
 					u.RanLog.Tracef("Sent %d bytes of data to RAN: %+v", n, buffer[:n])
 				}
 			}
-		case buffer := <-u.readFromRan:
+		case buffer := <-toTun:
 			n, err := u.ueTunnelDevice.Write(buffer)
 			if err != nil {
 				u.TunLog.Warnf("Error write to ue tunnel device: %+v", err)
@@ -836,7 +873,11 @@ func (u *Ue) updateDataPlane() {
 
 				tmp := make([]byte, n)
 				copy(tmp, buffer[:n])
-				u.readFromRan <- tmp
+				select {
+				case u.downlink <- tmp:
+				case <-u.stopped:
+					return
+				}
 			}
 		}()
 		u.TunLog.Debugln("Read from DC RAN data plane started")
@@ -855,6 +896,27 @@ func (u *Ue) updateDataPlane() {
 
 func (u *Ue) GetRanDataPlaneConn() net.Conn {
 	return u.ranDataPlaneConn
+}
+
+// UplinkPackets returns the uplink packet sink of an external data plane:
+// each IP packet sent on it goes to the RAN data plane, and the UE takes ownership of the slice.
+// Nothing receives after Stop, so senders should also select on their own shutdown signal.
+// It is nil when the UE owns a TUN.
+func (u *Ue) UplinkPackets() chan<- []byte {
+	if !u.externalDataPlane {
+		return nil
+	}
+	return u.uplink
+}
+
+// DownlinkPackets returns the downlink packet source of an external data plane:
+// it yields each IP packet received from the RAN data plane. It must be drained like a TUN,
+// or downlink reading stalls. It is never closed. It is nil when the UE owns a TUN.
+func (u *Ue) DownlinkPackets() <-chan []byte {
+	if !u.externalDataPlane {
+		return nil
+	}
+	return u.downlink
 }
 
 func (u *Ue) GetUeIp() string {
